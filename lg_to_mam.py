@@ -124,7 +124,6 @@ if __name__ == '__main__':
 
         for mam_torrent in r.json()['data']:
             if str(mam_torrent["id"]) in already_snatched:continue
-            if mam_torrent['owner_name'] == 'FastSquash':continue
             if mam_torrent['numfiles'] == 1 and mam_torrent['filetype'] in "epub mobi azw3 pdf".split(' '):
                 title = mam_torrent['title']
                 if type(title) == int:continue
