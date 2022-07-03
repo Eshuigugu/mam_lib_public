@@ -1,5 +1,6 @@
 import json
 import os
+import pickle
 from bs4 import BeautifulSoup
 import requests
 from datetime import datetime
@@ -14,23 +15,6 @@ import logging
 import sys
 import postmarkup
 from html2bbcode.parser import HTML2BBCode
-
-
-logger = logging.getLogger()
-logger.setLevel(logging.INFO)
-formatter = logging.Formatter('%(asctime)s | %(levelname)s | %(message)s',
-                              '%m-%d-%Y %H:%M:%S')
-
-stdout_handler = logging.StreamHandler(sys.stdout)
-stdout_handler.setLevel(logging.DEBUG)
-stdout_handler.setFormatter(formatter)
-
-file_handler = logging.FileHandler('logs.log')
-file_handler.setLevel(logging.DEBUG)
-file_handler.setFormatter(formatter)
-
-logger.addHandler(file_handler)
-logger.addHandler(stdout_handler)
 
 
 def get_publisher(epub_filepath, tag='publisher'):
@@ -71,9 +55,10 @@ def lg_edit_meta(edit_url, title, author, series, isbn, description, publisher, 
     # copy over existing metadata
     libgen_wanted_fields = ['metadata_source', 'title', 'authors', 'language', 'language_options', 'series', 'year',
                             'isbn', 'asin', 'cover', 'description']
+    overwrite_fields = ['description', 'isbn']
     for k, v in {x['name']: x['value'] for x in soup.find_all('input') if
                  x.has_attr('name') and x['name'] in libgen_wanted_fields and x['value']}.items():
-        if not (k in meta_data and meta_data[k]):
+        if not (k in meta_data and meta_data[k]) or (k in overwrite_fields and v):
             meta_data[k] = v
 
     data = MultipartEncoder(fields=meta_data)
@@ -99,7 +84,8 @@ def query_book_databases(query_str):
     if r.json():
         gr_title = r.json()[0]['bookTitleBare']
         gr_author = r.json()[0]['author']['name']
-        yield gr_title, gr_author
+        gr_work = r.json()[0]['workId']
+        yield gr_title, gr_author, gr_work
 
     url = 'https://www.googleapis.com/books/v1/volumes'
     r = sess.get(url, params={'q': query_str}, timeout=10)
@@ -118,8 +104,8 @@ def download_parse_metadata_and_upload(mam_book):
             print(f'book is missing {x}', mam_book)
             return
     # * growls * why does mam give me bbcode inside html * tail swishes angrily *
-    if mam_book['description'] != postmarkup.strip_bbcode(mam_book['description']):
-        mam_book['description'] = postmarkup.render_bbcode(html_to_bbcode_parser.feed(mam_book['description'])).replace('<br/><br/>', '<br/>')
+    #if mam_book['description'] != postmarkup.strip_bbcode(mam_book['description']):
+    #    mam_book['description'] = postmarkup.render_bbcode(html_to_bbcode_parser.feed(mam_book['description'])).replace('<br/><br/>', '<br/>')
     if 'myanonamouse.net' in mam_book['description'] or mam_book['description'] != postmarkup.strip_bbcode(mam_book['description']):
         print(f'bad description', mam_book['description'])
         mam_book['description'] = ''
@@ -147,7 +133,7 @@ def download_parse_metadata_and_upload(mam_book):
             return
 
     reduce_query_str = lambda query_str: ' '.join([x for x in query_str.split(' ') if len(x) > 1 and x.lower() not in stop_words])  # remove some words
-    get_title_varients = lambda x: {re.sub(' *(?:\:.*|\(.*\))* *$', '', x), re.sub(' *(?:\(.*\))* *$', '', x), x}
+    get_title_varients = lambda x: {re.sub(' *(?:[\-:].*|\(.*\))* *$', '', x), re.sub(' *(?:\(.*\))* *$', '', x), x}
     remove_except_alphanum = lambda x: re.sub('[^\w]', '', x)
 
     db_exact_match = False
@@ -156,7 +142,10 @@ def download_parse_metadata_and_upload(mam_book):
         query_str = reduce_query_str(query_str)
         # lg_results = libgen_search.search_lg(query_str, format='epub') if fiction else libgen_search.check_book_on_lg_nonfic(query_str)
         # search both fiction and nonfiction for the book
-        lg_results = libgen_search.search_lg(query_str, format='epub') or libgen_search.check_book_on_lg_nonfic(query_str)
+        try:lg_results = libgen_search.search_lg(query_str, format='epub') or libgen_search.check_book_on_lg_nonfic(query_str)
+        except Exception as e:
+            print(f'error checking is book on libgen {e}')
+            lg_results = True
         if lg_results:
             print(f'book is on libgen {lg_results}')
             return
@@ -164,7 +153,13 @@ def download_parse_metadata_and_upload(mam_book):
         # if we already know the book is on a book database don't bother checking again
         if db_exact_match:continue
 
-        for db_title, db_author in query_book_databases(query_str):
+        for db_entry in query_book_databases(query_str):
+            db_title, db_author = db_entry[0], db_entry[1]
+            if len(db_entry) == 3:
+                db_work = db_entry[2]
+                if libgen_search.check_work_on_lib(db_work):
+                    logger.info(f'book is on libgen sql {db_title}')
+                    return
             valid_titles = get_title_varients(title.lower())
             db_exact_match = bool(get_title_varients(db_title.lower()).intersection(valid_titles))
             if db_exact_match:
@@ -175,10 +170,12 @@ def download_parse_metadata_and_upload(mam_book):
                     logger.info(f'changing from title "{title}" to "{db_title}"')
                     title = db_title
                 # also try and fix the author cause why not
-                if db_title != author and remove_except_alphanum(author) == remove_except_alphanum(db_author):
+                if author != db_author and remove_except_alphanum(author) == remove_except_alphanum(db_author):
                     logger.info(f'changing from author "{author}" to "{db_author}"')
                     authors[author_idx] = db_author
 
+                # use shortest title
+                db_title = sorted(list(get_title_varients(db_title)), key=lambda x: len(x))[0]
                 if db_title != title or db_author != author:
                     db_query_str = f'{db_title} {db_author}'
                     lg_results = libgen_search.search_lg(db_query_str, format='epub') if fiction else\
@@ -222,6 +219,8 @@ def download_parse_metadata_and_upload(mam_book):
     t_file_names = [x.name for x in t_files if x.name.endswith('.epub')]
 
     epub_paths = [os.path.join(download_dir, x) for x in t_file_names]
+    epub_paths += [os.path.join(download_dir, str(mam_book['id']), x) for x in t_file_names]  # also check this path cause that's how i organize
+    epub_paths = [x for x in epub_paths if os.path.exists(x)]
     if not epub_paths:
         logger.info('didnt download any epubs')
         return
@@ -248,7 +247,7 @@ def download_parse_metadata_and_upload(mam_book):
 
     upload_url = upload_ebook_to_libgen(epub_path) if fiction else upload_ebook_to_libgen(epub_path, libgen_upload_url='https://library.bz/main/upload/')
     if not upload_url:
-        logger.info(f'upload failed for "{title}" torrent id: ' + str(mam_book['id']))
+        logger.info(f'failed upload for "{title}" torrent id: ' + str(mam_book['id']))
     else:
         print(title, epub_path, upload_url)
         r = lg_edit_meta(edit_url=upload_url,
@@ -258,10 +257,7 @@ def download_parse_metadata_and_upload(mam_book):
 
 
 def get_books_from_mam(num_to_fetch=50, start_num=0):
-    my_cookies = {
-        'mam_id': mam_id}
-
-    r = sess.get('https://www.myanonamouse.net/jsonLoad.php?snatch_summary', cookies=my_cookies, timeout=60)
+    r = sess.get('https://www.myanonamouse.net/jsonLoad.php?snatch_summary', cookies=mam_cookies, timeout=60)
     snatch_summary = r.json()
     mam_limit = snatch_summary['unsat']['limit'] - snatch_summary['unsat']['count']
     num_to_fetch = min(num_to_fetch, mam_limit)
@@ -283,6 +279,7 @@ def get_books_from_mam(num_to_fetch=50, start_num=0):
                 "minSize": '10',
                 "maxSize": str(40*1024),
                 "unit": '1024',  # size restrictions limit libgen uploads. must be in range 10Kb - 200 Mb
+                # "searchIn": 'mine',
                 "srchIn": {
                     x: "true" for x in (searchin if type(searchin) == list else [searchin])
                 }
@@ -293,13 +290,15 @@ def get_books_from_mam(num_to_fetch=50, start_num=0):
         }
 
         r = sess.post('https://www.myanonamouse.net/tor/js/loadSearchJSONbasic.php', json=json_dict,
-                      cookies=my_cookies, timeout=60)
-        start_num += r.json()['perpage']
+                      cookies=mam_cookies, timeout=60)
         # only accept torrents with less than 3 files to avoid collections
         mam_books += [x for x in r.json()['data'] if x['numfiles'] <= 2 and x['id'] not in upload_blacklist]
         if start_num >= r.json()['found']:
             print(f'no more MAM books to process')
             break
+        else:
+            start_num += r.json()['perpage']
+    pickle.dump(sess, open(sess_filepath, 'wb'))
     return mam_books, mam_limit, start_num
 
 
@@ -312,22 +311,30 @@ transmission_username, transmission_password = 'username:password'.split(':')
 transmission_ip = '127.0.0.1'
 transmission_port = 9091  # 9091 is transmission's default port
 lg_public_auth = 'Basic Z2VuZXNpczp1cGxvYWQ='  # not a secret. it's genesis:upload base64 encoded
-
 trans_client = Client(host=transmission_ip, port=transmission_port, username=transmission_username, password=transmission_password)
 client_download_dir = '/download/'  # path where torrent client will download the ebooks to
 download_dir = '/download/'  # path that the computer running this script will find the downloaded ebooks at
-
 mam_id = ''
 resume_pagination_of_mam = True
 
 limit = 50
-sess = requests.Session()
+trans_client = Client(host=transmission_ip, port=transmission_port, username=transmission_username, password=transmission_password)
 stop_words = ['a', 'the', 'and', 'aka', 'book', 'novel']  # won't include these words in queries
 
 if '__file__' in globals():
     pwd = os.path.split(__file__)[:-1]
 else:
     pwd = []
+
+sess_filepath = os.path.join(*pwd, 'sess.pkl')
+# we reuse the session to save the cookies
+if os.path.exists(sess_filepath):
+    sess = pickle.load(open(sess_filepath, 'rb'))
+    mam_cookies = None
+else:
+    sess = requests.Session()
+    mam_cookies = {'mam_id': mam_id}
+
 blacklist_filepath = os.path.join(*pwd, 'mam_id_blacklist.txt')
 upload_blacklist = []
 if os.path.exists(blacklist_filepath):
@@ -340,15 +347,37 @@ if os.path.exists(blacklist_filepath) and resume_pagination_of_mam:
     with open(mam_start_num_filepath, 'r') as f:
         mam_start_num = json.load(f)
 
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+formatter = logging.Formatter('%(asctime)s | %(levelname)s | %(message)s',
+                              '%m-%d-%Y %H:%M:%S')
+
+stdout_handler = logging.StreamHandler(sys.stdout)
+stdout_handler.setLevel(logging.DEBUG)
+stdout_handler.setFormatter(formatter)
+
+file_handler = logging.FileHandler(os.path.join(*pwd, 'logs.log'))
+file_handler.setLevel(logging.DEBUG)
+file_handler.setFormatter(formatter)
+
+logger.addHandler(file_handler)
+logger.addHandler(stdout_handler)
+
+max_to_fetch_per_hundred = 20
 
 if __name__ == '__main__':
     while limit > 0:
         mam_books, mam_limit, mam_start_num = get_books_from_mam(num_to_fetch=limit, start_num=mam_start_num)
-        limit = min(limit, mam_limit)
+        mam_books.sort(key=lambda x:x['times_completed'], reverse=True)
+        limit = min(limit, mam_limit - 1)
+        if limit <= 0:break
+        # loop limit is relative to limit cause limit is decremented in the upload function while loop_limit isn't. should probably improve this thing
+        loop_limit = limit - max_to_fetch_per_hundred # if limit is 30 then exit when limit == limit - fetch_per_hundred
         logger.info(f'limit of {limit}')
         logger.info(f'start_num: {mam_start_num}')
 
         for mam_book in mam_books:
+            if mam_book['owner_name'] == 'FastSquash':continue
             if mam_book['id'] in upload_blacklist:
                 print(f'{mam_book["title"]} in blacklist')
                 continue
@@ -359,10 +388,12 @@ if __name__ == '__main__':
 
             download_parse_metadata_and_upload(mam_book)
 
-            if limit <= 0:
+            if limit <= 0 or limit <= loop_limit:
                 print(f'reached upload limit')
                 break
         if limit > 0:
             if resume_pagination_of_mam:
                 with open(mam_start_num_filepath, 'w') as f:
                     f.write(json.dumps(mam_start_num))
+
+
