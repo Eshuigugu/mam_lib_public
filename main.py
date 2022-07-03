@@ -377,7 +377,6 @@ if __name__ == '__main__':
         logger.info(f'start_num: {mam_start_num}')
 
         for mam_book in mam_books:
-            if mam_book['owner_name'] == 'FastSquash':continue
             if mam_book['id'] in upload_blacklist:
                 print(f'{mam_book["title"]} in blacklist')
                 continue
