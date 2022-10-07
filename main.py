@@ -103,9 +103,7 @@ def download_parse_metadata_and_upload(mam_book):
         if not (x in mam_book and mam_book[x]):
             print(f'book is missing {x}', mam_book)
             return
-    # * growls * why does mam give me bbcode inside html * tail swishes angrily *
-    #if mam_book['description'] != postmarkup.strip_bbcode(mam_book['description']):
-    #    mam_book['description'] = postmarkup.render_bbcode(html_to_bbcode_parser.feed(mam_book['description'])).replace('<br/><br/>', '<br/>')
+    # skip books with BBCode in description
     if 'myanonamouse.net' in mam_book['description'] or mam_book['description'] != postmarkup.strip_bbcode(mam_book['description']):
         print(f'bad description', mam_book['description'])
         mam_book['description'] = ''
